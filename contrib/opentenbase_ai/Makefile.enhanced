@@ -1,0 +1,44 @@
+# contrib/opentenbase_ai/Makefile
+# Enhanced version with caching support
+
+EXTENSION = opentenbase_ai
+MODULES = ai
+DATA = opentenbase_ai--1.0.sql opentenbase_ai--1.0--1.1.sql
+PGFILEDESC = "opentenbase_ai - AI extension with intelligent result caching"
+
+# Include both original and cache enhancement objects
+OBJS = ai.o ai_cache_enhancement.o
+
+REGRESS = opentenbase_ai opentenbase_ai_cache
+EXTRA_INSTALL = contrib/pgsql-http
+
+# Add libcurl and pthread dependencies
+SHLIB_LINK += -lcurl -lpthread
+
+# Add compiler flags for cache optimization
+PG_CPPFLAGS += -DENABLE_AI_CACHE -O2
+
+ifdef USE_PGXS
+PG_CONFIG = pg_config
+PGXS := $(shell $(PG_CONFIG) --pgxs)
+include $(PGXS)
+else
+subdir = contrib/opentenbase_ai
+top_builddir = ../..
+include $(top_builddir)/src/Makefile.global
+include $(top_srcdir)/contrib/contrib-global.mk
+endif
+
+# Custom build targets
+ai_cache_enhancement.o: ai_cache_enhancement.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -fPIC -c -o $@ $<
+
+# Installation targets
+install-cache-demo:
+	$(INSTALL_DATA) cache_demo.sql '$(DESTDIR)$(datadir)/extension/'
+
+# Testing targets
+test-cache: install
+	$(MAKE) -C $(top_builddir)/contrib/opentenbase_ai installcheck REGRESS=opentenbase_ai_cache
+
+.PHONY: install-cache-demo test-cache
