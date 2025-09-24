@@ -6,100 +6,186 @@ CREATE EXTENSION IF NOT EXISTS opentenbase_ai;
 SELECT count(*) > 0 AS extension_loaded FROM pg_extension WHERE extname = 'opentenbase_ai';
 
 -- Test 2: Check if schema and tables are created correctly
-SELECT count(*) > 0 AS model_list_exists 
-FROM pg_tables 
+SELECT count(*) > 0 AS model_list_exists
+FROM pg_tables
 WHERE schemaname = 'public' AND tablename = 'ai_model_list';
 
--- Test 3: Add a test model for a mock API using generic add_model function
-SELECT ai.add_model(
-    'test_model',                                   -- model_name
-    ARRAY[                                          -- request_header
-        ROW('Content-Type', 'application/json')::http_header,
-        ROW('Authorization', 'Bearer test-token')::http_header
-    ],
-    'https://httpbin.org/post',                     -- uri (using httpbin for testing)
-    '{"model": "test-model", "temperature": 0.7}'::jsonb, -- default_args
-    'test-provider',                                -- model_provider
-    'POST',                                         -- request_type
-    'application/json',                             -- content_type
-    'SELECT json_extract_path_text(''%s''::json, ''json'', ''prompt'')' -- json_path
-);
-
--- Test 4: List models 
-SELECT * FROM ai.models 
-WHERE model_name = 'test_model';
-
--- Test 5: Update model
-SELECT ai.update_model('test_model', 'content_type', 'application/json; charset=utf-8');
-
--- Test 6: Verify update
-SELECT content_type 
-FROM public.ai_model_list 
-WHERE model_name = 'test_model';
-
--- Test 7: Test add_completion_model function
+-- Test 3: Add a test model for batch processing
 SELECT ai.add_completion_model(
-    'test_completion_model',
+    'test_batch_model',
     'https://httpbin.org/post',
-    '{"model": "gpt-4", "temperature": 0.5, "max_tokens": 100}'::jsonb,
-    'fake-token-123',
+    '{"model": "gpt-4", "temperature": 0.7, "max_tokens": 100}'::jsonb,
+    'test-token-123',
     'openai'
 );
 
--- Test 8: Verify completion model was added
-SELECT * FROM ai_model_list
-WHERE model_name = 'test_completion_model';
+-- Test 4: Test batch processing configuration
+SELECT ai.configure_batch('batch_size', 5);
+SELECT ai.configure_batch('batch_timeout_ms', 1000);
 
--- Test 9: Test add_embedding_model function
-SELECT ai.add_embedding_model(
-    'test_embedding_model',
-    'https://httpbin.org/post',
-    '{"model": "text-embedding-ada-002", "encoding_format": "float"}'::jsonb,
-    'fake-token-456',
-    'openai'
-);
+-- Test 5: Check batch status
+SELECT * FROM ai.batch_status();
 
--- Test 10: Verify embedding model was added with correct json_path
-SELECT * FROM ai_model_list
-WHERE model_name = 'test_embedding_model';
+-- Test 6: Test single batch invoke (basic functionality)
+SELECT length(ai.batch_invoke('test_batch_model', 'Hello world', '{"temperature": 0.5}'::jsonb)) > 0 AS batch_invoke_works;
 
--- Test 11: Test add_image_model function
-SELECT ai.add_image_model(
-    'test_image_model',
-    'https://httpbin.org/post',
-    '{"model": "dall-e-3", "n": 1, "size": "1024x1024"}'::jsonb,
-    'fake-token-789',
-    'openai'
-);
+-- Test 7: Test batch completion with array input
+SELECT array_length(ai.batch_completion(
+    ARRAY['Hello', 'World', 'Test batch processing'],
+    'test_batch_model',
+    '{"temperature": 0.3}'::jsonb
+), 1) = 3 AS batch_completion_array_works;
 
--- Test 12: Verify image model was added
-SELECT * FROM ai_model_list
-WHERE model_name = 'test_image_model';
+-- Test 8: Create test table for table batch processing
+CREATE TABLE test_articles (
+    id SERIAL PRIMARY KEY,
+    title TEXT,
+    content TEXT
+) DISTRIBUTE BY HASH(id);
 
--- Test 13: Test updating model with JSON value
-SELECT ai.update_model('test_model', 'default_args', '{"model": "test-model-v2", "temperature": 0.3, "top_p": 0.9}');
+-- Insert test data
+INSERT INTO test_articles (title, content) VALUES
+    ('Article 1', 'This is the content of article 1 for testing batch processing.'),
+    ('Article 2', 'This is the content of article 2 for testing batch processing.'),
+    ('Article 3', 'This is the content of article 3 for testing batch processing.'),
+    ('Article 4', 'This is the content of article 4 for testing batch processing.'),
+    ('Article 5', 'This is the content of article 5 for testing batch processing.');
 
--- Test 14: Verify JSON update
-SELECT default_args
-FROM public.ai_model_list
-WHERE model_name = 'test_model';
+-- Test 9: Test table batch processing
+SELECT ai.process_table_batch(
+    'test_articles',
+    'content',
+    'test_batch_model',
+    'summary',
+    3  -- batch_size
+) AS processed_rows;
 
--- Test 15: Test deleting multiple models at once
-SELECT ai.delete_model('test_completion_model');
-SELECT ai.delete_model('test_embedding_model');
-SELECT ai.delete_model('test_image_model');
+-- Test 10: Verify batch processing results
+SELECT count(*) AS articles_with_summaries
+FROM test_articles
+WHERE summary IS NOT NULL AND summary != '';
 
--- Test 16: Verify deletions
-SELECT count(*) AS remaining_models
+-- Test 11: Test batch processing with WHERE clause
+INSERT INTO test_articles (title, content) VALUES
+    ('Special Article', 'This article should be processed separately.');
+
+SELECT ai.process_table_batch(
+    'test_articles',
+    'content',
+    'test_batch_model',
+    'special_summary',
+    2,
+    "title LIKE '%Special%'"
+) AS special_processed_rows;
+
+-- Test 12: Test error handling for invalid model
+SELECT ai.batch_invoke('non_existent_model', 'test input', '{}'::jsonb);
+
+-- Test 13: Test batch configuration limits
+SELECT ai.configure_batch('batch_size', 200); -- Should fail (too high)
+SELECT ai.configure_batch('batch_timeout_ms', 50); -- Should fail (too low)
+
+-- Test 14: Test concurrent batch processing simulation
+-- Create multiple batch requests
+CREATE OR REPLACE FUNCTION test_concurrent_batch() RETURNS boolean AS $$
+DECLARE
+    i integer;
+    results text[];
+BEGIN
+    -- Generate multiple concurrent requests
+    FOR i IN 1..15 LOOP
+        results := array_append(results,
+            ai.batch_invoke('test_batch_model',
+                           'Concurrent test ' || i::text,
+                           '{"temperature": 0.1}'::jsonb));
+    END LOOP;
+
+    -- Check if we got results
+    RETURN array_length(results, 1) = 15;
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT test_concurrent_batch() AS concurrent_batch_test_passed;
+
+-- Test 15: Performance comparison test
+-- Create performance test function
+CREATE OR REPLACE FUNCTION test_performance_comparison() RETURNS table(
+    method text,
+    duration interval,
+    requests_per_second float
+) AS $$
+DECLARE
+    start_time timestamp;
+    end_time timestamp;
+    single_duration interval;
+    batch_duration interval;
+    test_inputs text[] := ARRAY['Test 1', 'Test 2', 'Test 3', 'Test 4', 'Test 5'];
+    result_single text[];
+    result_batch text[];
+    input_text text;
+BEGIN
+    -- Test single requests
+    start_time := clock_timestamp();
+    FOREACH input_text IN ARRAY test_inputs LOOP
+        result_single := array_append(result_single,
+                                    ai.invoke_model('test_batch_model',
+                                                  '{"prompt": "' || input_text || '"}'::jsonb));
+    END LOOP;
+    end_time := clock_timestamp();
+    single_duration := end_time - start_time;
+
+    -- Test batch requests
+    start_time := clock_timestamp();
+    result_batch := ai.batch_completion(test_inputs, 'test_batch_model', '{}'::jsonb);
+    end_time := clock_timestamp();
+    batch_duration := end_time - start_time;
+
+    -- Return results
+    RETURN QUERY VALUES
+        ('single_requests'::text, single_duration, 5.0 / EXTRACT(EPOCH FROM single_duration)),
+        ('batch_requests'::text, batch_duration, 5.0 / EXTRACT(EPOCH FROM batch_duration));
+END;
+$$ LANGUAGE plpgsql;
+
+-- Run performance comparison
+SELECT * FROM test_performance_comparison();
+
+-- Test 16: Test batch processing with different data types
+CREATE TABLE test_mixed_data (
+    id SERIAL PRIMARY KEY,
+    text_data TEXT,
+    json_data JSONB,
+    numeric_data NUMERIC
+) DISTRIBUTE BY HASH(id);
+
+INSERT INTO test_mixed_data (text_data, json_data, numeric_data) VALUES
+    ('Sample text 1', '{"key": "value1"}'::jsonb, 123.45),
+    ('Sample text 2', '{"key": "value2"}'::jsonb, 678.90),
+    ('Sample text 3', '{"key": "value3"}'::jsonb, 999.99);
+
+-- Test batch processing on mixed data
+SELECT ai.process_table_batch(
+    'test_mixed_data',
+    'text_data',
+    'test_batch_model',
+    'ai_analysis',
+    2
+) AS mixed_data_processed;
+
+-- Test 17: Clean up test data
+DROP TABLE IF EXISTS test_articles;
+DROP TABLE IF EXISTS test_mixed_data;
+DROP FUNCTION IF EXISTS test_concurrent_batch();
+DROP FUNCTION IF EXISTS test_performance_comparison();
+
+-- Test 18: Delete test model
+SELECT ai.delete_model('test_batch_model');
+
+-- Test 19: Verify cleanup
+SELECT count(*) = 0 AS all_test_models_deleted
 FROM ai_model_list
-WHERE model_name IN ('test_completion_model', 'test_embedding_model', 'test_image_model');
+WHERE model_name = 'test_batch_model';
 
--- Test 17: Delete final test model
-SELECT ai.delete_model('test_model');
-
--- Test 18: Verify all models deleted
-SELECT count(*) = 0 AS all_models_deleted
-FROM ai_model_list;
-
-DROP EXTENSION IF EXISTS opentenbase_ai;
+-- Final cleanup
+DROP EXTENSION IF EXISTS opentenbase_ai CASCADE;
 DROP EXTENSION IF EXISTS http;

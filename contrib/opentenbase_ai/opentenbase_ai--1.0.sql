@@ -578,3 +578,168 @@ BEGIN
     RETURN ai.image(prompt, 'data:' || mime_type || ';base64,' || base64_image, model_name, config);
 END;
 $$ LANGUAGE plpgsql;
+
+-- ===========================================
+-- Batch Processing Functions
+-- ===========================================
+
+-- Batch invoke function for high-performance AI processing
+CREATE OR REPLACE FUNCTION ai.batch_invoke(
+    model_name text,
+    input_data text,
+    user_args jsonb DEFAULT '{}'::jsonb
+) RETURNS text AS 'MODULE_PATHNAME', 'ai_batch_invoke'
+LANGUAGE C STRICT VOLATILE;
+
+-- Configure batch processing parameters
+CREATE OR REPLACE FUNCTION ai.configure_batch(
+    param_name text,
+    param_value integer
+) RETURNS boolean AS 'MODULE_PATHNAME', 'ai_configure_batch'
+LANGUAGE C STRICT;
+
+-- Batch completion function with array input
+CREATE OR REPLACE FUNCTION ai.batch_completion(
+    inputs text[],
+    model_name text = NULL,
+    config jsonb = '{}'::jsonb
+) RETURNS text[] AS $$
+DECLARE
+    model_name_v text;
+    result text[];
+    input_text text;
+BEGIN
+    -- Get model name
+    model_name_v := COALESCE(model_name, current_setting('ai.completion_model', true));
+
+    IF model_name_v IS NULL THEN
+        RAISE EXCEPTION 'Completion model name is not set';
+    END IF;
+
+    -- Process each input using batch processing
+    FOREACH input_text IN ARRAY inputs
+    LOOP
+        result := array_append(result, ai.batch_invoke(model_name_v, input_text, config));
+    END LOOP;
+
+    RETURN result;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Batch embedding function
+CREATE OR REPLACE FUNCTION ai.batch_embedding(
+    inputs text[],
+    model_name text = NULL,
+    config jsonb = '{}'::jsonb
+) RETURNS float4[][] AS $$
+DECLARE
+    model_name_v text;
+    result float4[][];
+    input_text text;
+    embedding_result text;
+    embedding_json jsonb;
+    embedding_array float4[];
+BEGIN
+    -- Get model name
+    model_name_v := COALESCE(model_name, current_setting('ai.embedding_model', true));
+
+    IF model_name_v IS NULL THEN
+        RAISE EXCEPTION 'Embedding model name is not set';
+    END IF;
+
+    -- Process each input using batch processing
+    FOREACH input_text IN ARRAY inputs
+    LOOP
+        embedding_result := ai.batch_invoke(model_name_v, input_text, config);
+
+        -- Parse the embedding result (assuming JSON format)
+        BEGIN
+            embedding_json := embedding_result::jsonb;
+            -- Extract the embedding array - adjust path based on your API response
+            SELECT array_agg((value->>0)::float4)
+            INTO embedding_array
+            FROM jsonb_array_elements(embedding_json->'data'->0->'embedding');
+
+            result := array_append(result, embedding_array);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE EXCEPTION 'Failed to parse embedding result: %', embedding_result;
+        END;
+    END LOOP;
+
+    RETURN result;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Utility function to get batch processing status
+CREATE OR REPLACE FUNCTION ai.batch_status()
+RETURNS table(
+    parameter text,
+    value text,
+    description text
+) AS $$
+BEGIN
+    RETURN QUERY VALUES
+        ('batch_size'::text, current_setting('ai.batch_size', true)::text, 'Number of requests to batch together'::text),
+        ('batch_timeout_ms'::text, current_setting('ai.batch_timeout_ms', true)::text, 'Maximum wait time before processing batch'::text),
+        ('enable_batch_processing'::text, current_setting('ai.enable_batch_processing', true)::text, 'Whether batch processing is enabled'::text);
+END;
+$$ LANGUAGE plpgsql;
+
+-- High-level batch processing function for common use cases
+CREATE OR REPLACE FUNCTION ai.process_table_batch(
+    table_name text,
+    text_column text,
+    model_name text,
+    result_column text = 'ai_result',
+    batch_size integer = 10,
+    where_clause text = ''
+) RETURNS integer AS $$
+DECLARE
+    sql_text text;
+    batch_count integer := 0;
+    total_processed integer := 0;
+BEGIN
+    -- Validate inputs
+    IF table_name IS NULL OR text_column IS NULL OR model_name IS NULL THEN
+        RAISE EXCEPTION 'table_name, text_column, and model_name are required';
+    END IF;
+
+    -- Add result column if it doesn't exist
+    BEGIN
+        sql_text := format('ALTER TABLE %I ADD COLUMN %I text', table_name, result_column);
+        EXECUTE sql_text;
+    EXCEPTION WHEN duplicate_column THEN
+        -- Column already exists, continue
+    END;
+
+    -- Configure batch size
+    PERFORM ai.configure_batch('batch_size', batch_size);
+
+    -- Build and execute batch processing SQL
+    sql_text := format('
+        UPDATE %I
+        SET %I = ai.batch_invoke(%L, %I, %L::jsonb)
+        WHERE %I IS NULL OR %I = %L',
+        table_name, result_column, model_name, text_column, '{}',
+        result_column, result_column, ''
+    );
+
+    -- Add WHERE clause if provided
+    IF where_clause != '' THEN
+        sql_text := sql_text || ' AND (' || where_clause || ')';
+    END IF;
+
+    EXECUTE sql_text;
+    GET DIAGNOSTICS total_processed = ROW_COUNT;
+
+    RETURN total_processed;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Grant permissions on new functions
+GRANT EXECUTE ON FUNCTION ai.batch_invoke(text, text, jsonb) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION ai.configure_batch(text, integer) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION ai.batch_completion(text[], text, jsonb) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION ai.batch_embedding(text[], text, jsonb) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION ai.batch_status() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION ai.process_table_batch(text, text, text, text, integer, text) TO PUBLIC;
